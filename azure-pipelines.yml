@@ -1,0 +1,68 @@
+trigger:
+    - main
+
+pool:
+    vmImage: "ubuntu-latest"
+
+variables:
+    GCP_PROJECT_ID: "vision-270320"
+    GCP_REGION: "southamerica-east1"
+    GCP_REPOSITORY_NAME: "vision-registry"
+    IMAGE_NAME: "keycloak-sisand"
+    IMAGE_TAG: "$(Build.BuildId)"
+    # GKE Config
+    GKE_CLUSTER: "renave-connector-gke-test"
+    GKE_NAMESPACE: "workspace"
+    GKE_DEPLOYMENT: "sisand-keycloak"
+
+steps:
+    - task: NodeTool@0
+      inputs:
+          versionSpec: "18.x"
+      displayName: "Install Node.js"
+
+    - script: npm install -g yarn
+      displayName: "Install Yarn"
+
+    - script: |
+          yarn install
+          version='kcfy-$(Build.BuildId)'
+          export VITE_VERSION=$version
+          npm run build
+          npx keycloakify build
+          cd dist_keycloak
+          echo $version > version.md
+          ls -la
+          cat version.md
+      displayName: "Build Keycloakify Theme (.jar)"
+
+    - script: |
+          # Login usando a chave da Service Account (deve estar configurada como secret variable)
+          echo "$(GCP_SERVICE_ACCOUNT_KEY)" | docker login -u _json_key --password-stdin https://$(GCP_REGION)-docker.pkg.dev
+      displayName: "Login to GCP Artifact Registry"
+      condition: succeeded()
+      env:
+          GCP_SERVICE_ACCOUNT_KEY: $(GCP_SERVICE_ACCOUNT_KEY)
+
+    - script: |
+          IMAGE_URI="$(GCP_REGION)-docker.pkg.dev/$(GCP_PROJECT_ID)/$(GCP_REPOSITORY_NAME)/$(IMAGE_NAME)"
+          
+          echo "Building Docker Image..."
+          docker build -t $IMAGE_URI:$(IMAGE_TAG) \
+                       -t $IMAGE_URI:latest .
+
+          echo "Pushing to GCP Artifact Registry..."
+          docker push $IMAGE_URI:$(IMAGE_TAG)
+          docker push $IMAGE_URI:latest
+      displayName: "Docker Build & Push to GCP"
+
+    - task: KubernetesManifest@1
+      displayName: "Update GKE Deployment"
+      inputs:
+          action: "patch"
+          kind: "deployment"
+          name: "$(GKE_DEPLOYMENT)"
+          namespace: "$(GKE_NAMESPACE)"
+          resourceToPatch: "deploy/$(GKE_DEPLOYMENT)"
+          patch: '{"spec": {"template": {"spec": {"containers": [{"name": "keycloak", "image": "$(GCP_REGION)-docker.pkg.dev/$(GCP_PROJECT_ID)/$(GCP_REPOSITORY_NAME)/$(IMAGE_NAME):$(IMAGE_TAG)"}]}}}}'
+          kubernetesServiceConnection: "GKE_CONNECTION" # Nome da Service Connection que deve ser criada no Azure DevOps
